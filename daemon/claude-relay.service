@@ -1,57 +1,32 @@
 [Unit]
-Description=Claude Code Telegram Relay
+Description=Discord + Telegram Relay (Claude Code)
 After=network.target
 
 [Service]
 Type=simple
-# UPDATE THIS: Your username
-User=YOUR_USERNAME
-# UPDATE THIS: Path to relay directory
-WorkingDirectory=/home/YOUR_USERNAME/claude-telegram-relay
-# UPDATE THIS: Path to bun
-ExecStart=/home/YOUR_USERNAME/.bun/bin/bun run src/relay.ts
+User=ubuntu
+WorkingDirectory=/home/ubuntu/discord-telegram-relay
+ExecStart=/usr/bin/bun run /home/ubuntu/discord-telegram-relay/src/relay.js
 Restart=always
 RestartSec=10
 
-# Environment
-Environment=HOME=/home/YOUR_USERNAME
-Environment=PATH=/home/YOUR_USERNAME/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# Environment variables (set these separately or use a .env file)
+Environment=TELEGRAM_BOT_TOKEN=your_telegram_token
+Environment=TELEGRAM_USER_ID=your_telegram_id
+Environment=DISCORD_BOT_TOKEN=your_discord_token
+Environment=DISCORD_CHANNEL_IDS=your_channel_ids
+Environment=MCP_URL=http://localhost:3001/sse
+Environment=MCP_API_KEY=your_mcp_api_key
+Environment=CLAUDE_PATH=claude
+Environment=USER_NAME=Diego
+Environment=USER_TIMEZONE=America/Lima
 
-# Optional: Load .env file
-# EnvironmentFile=/home/YOUR_USERNAME/claude-telegram-relay/.env
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=claude-relay
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/ubuntu/.discord-telegram-relay
 
 [Install]
 WantedBy=multi-user.target
-
-# SETUP INSTRUCTIONS:
-#
-# 1. Replace all YOUR_USERNAME with your actual Linux username
-#
-# 2. Copy to systemd:
-#    sudo cp daemon/claude-relay.service /etc/systemd/system/
-#
-# 3. Reload systemd:
-#    sudo systemctl daemon-reload
-#
-# 4. Enable (start on boot):
-#    sudo systemctl enable claude-relay
-#
-# 5. Start:
-#    sudo systemctl start claude-relay
-#
-# 6. Check status:
-#    sudo systemctl status claude-relay
-#
-# 7. View logs:
-#    journalctl -u claude-relay -f
-#
-# 8. Stop:
-#    sudo systemctl stop claude-relay
-#
-# 9. Disable:
-#    sudo systemctl disable claude-relay

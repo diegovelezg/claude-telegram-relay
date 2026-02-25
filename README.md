@@ -1,173 +1,125 @@
-# Claude Telegram Relay
+# Discord + Telegram Relay
 
-A personal AI assistant on Telegram powered by Claude Code.
+A personal AI assistant on Discord and Telegram powered by Claude Code.
 
-You message it. Claude responds. Text, photos, documents, voice. It remembers across sessions, checks in proactively, and runs in the background.
-
-**Created by [Goda Go](https://youtube.com/@GodaGo)** | [AI Productivity Hub Community](https://skool.com/autonomee)
-
-```
-You ──▶ Telegram ──▶ Relay ──▶ Claude Code CLI ──▶ Response
-                                    │
-                              Supabase (memory)
-```
+You message it on Discord or Telegram. Claude responds. Text, photos, documents, voice. It remembers across sessions using MCP for memory.
 
 ## What You Get
 
-- **Relay**: Send messages on Telegram, get Claude responses back
-- **Memory**: Semantic search over conversation history, persistent facts and goals via Supabase
-- **Proactive**: Smart check-ins that know when to reach out (and when not to)
-- **Briefings**: Daily morning summary with goals and schedule
-- **Voice**: Transcribe voice messages (Groq cloud or local Whisper — your choice)
+- **Dual Platform**: Works on both Discord and Telegram simultaneously
+- **Memory via MCP**: Uses Diego's MCP server for persistent memory
+- **Voice**: Transcribe voice messages (Groq or local Whisper)
 - **Always On**: Runs in the background, starts on boot, restarts on crash
-- **Guided Setup**: Claude Code reads CLAUDE.md and walks you through everything
 
 ## Quick Start
 
 ### Prerequisites
 
-- **[Bun](https://bun.sh)** runtime (`curl -fsSL https://bun.sh/install | bash`)
+- **[Bun](https://bun.sh)** runtime
 - **[Claude Code](https://claude.ai/claude-code)** CLI installed and authenticated
-- A **Telegram** account
+- **Discord** and/or **Telegram** account
 
-### Option A: Guided Setup (Recommended)
-
-```bash
-git clone https://github.com/godagoo/claude-telegram-relay.git
-cd claude-telegram-relay
-claude
-```
-
-Claude Code reads `CLAUDE.md` and walks you through setup conversationally:
-
-1. Create a Telegram bot via BotFather
-2. Set up Supabase for persistent memory
-3. Personalize your profile
-4. Test the bot
-5. Configure always-on services
-6. Set up proactive check-ins and briefings
-7. Add voice transcription (optional)
-
-### Option B: Manual Setup
+### Setup
 
 ```bash
-git clone https://github.com/godagoo/claude-telegram-relay.git
-cd claude-telegram-relay
-bun run setup          # Install deps, create .env
-# Edit .env with your API keys
-bun run test:telegram  # Verify bot token
-bun run test:supabase  # Verify database
-bun run start          # Start the bot
+# Clone and install
+git clone https://github.com/diegovelezg/discord-telegram-relay.git
+cd discord-telegram-relay
+bun install
+
+# Create .env file
+cp .env.example .env
+# Edit .env with your tokens
+
+# Test connections
+bun run setup/test-all.ts
+
+# Run
+bun run start
 ```
+
+### Telegram Setup
+
+1. Message @BotFather on Telegram
+2. Create a new bot with /newbot
+3. Copy the token to TELEGRAM_BOT_TOKEN
+4. Get your user ID from @userinfobot
+5. Set TELEGRAM_USER_ID
+
+### Discord Setup
+
+1. Go to Discord Developer Portal
+2. Create a new application
+3. Add a bot to the application
+4. Copy the bot token to DISCORD_BOT_TOKEN
+5. Enable Message Content Intent
+6. Invite bot to your server
+7. Set DISCORD_CHANNEL_IDS (comma-separated channel IDs)
+
+### MCP Setup
+
+Configure your MCP server:
+- MCP_URL: Your MCP server URL
+- MCP_API_KEY: Your MCP API key
 
 ## Commands
 
 ```bash
-# Run
-bun run start              # Start the bot
-bun run dev                # Start with auto-reload
-
-# Setup & Testing
-bun run setup              # Install dependencies, create .env
-bun run test:telegram      # Test Telegram connection
-bun run test:supabase      # Test Supabase connection
-bun run setup:verify       # Full health check
-
-# Always-On Services
-bun run setup:launchd      # Configure launchd (macOS)
-bun run setup:services     # Configure PM2 (Windows/Linux)
-
-# Use --service flag for specific services:
-# bun run setup:launchd -- --service relay
-# bun run setup:launchd -- --service all    (relay + checkin + briefing)
+bun run start           # Start the relay
+bun run dev             # Start with auto-reload
+bun run setup:test-all  # Test all connections
 ```
+
+## VPS Deployment
+
+### 1. Install Dependencies
+
+```bash
+ssh your-vps
+curl -fsSL https://bun.sh/install | bash
+git clone <this-repo>
+cd discord-telegram-relay
+bun install
+```
+
+### 2. Configure Environment
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Set your tokens (or use systemd environment variables).
+
+### 3. Install Systemd Service
+
+```bash
+sudo cp daemon/claude-relay.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable claude-relay
+sudo systemctl start claude-relay
+```
+
+### 4. Security (Recommended)
+
+- Use SSL/TLS via nginx reverse proxy
+- Set up fail2ban for brute-force protection
+- Keep tokens in systemd environment, not .env
+- Use firewall to limit access
 
 ## Project Structure
 
 ```
-CLAUDE.md                    # Guided setup (Claude Code reads this)
 src/
-  relay.ts                   # Core relay daemon
-  transcribe.ts              # Voice transcription (Groq / whisper.cpp)
-  memory.ts                  # Persistent memory (facts, goals, semantic search)
-examples/
-  smart-checkin.ts           # Proactive check-ins
-  morning-briefing.ts        # Daily briefing
-  memory.ts                  # Memory persistence patterns
+  relay.ts         # Main relay (Discord + Telegram)
+  memory.ts        # MCP integration for memory
+  transcribe.ts    # Voice transcription
 config/
-  profile.example.md         # Personalization template
-db/
-  schema.sql                 # Supabase database schema
-supabase/
-  functions/
-    embed/index.ts           # Auto-embedding Edge Function
-    search/index.ts          # Semantic search Edge Function
-setup/
-  install.ts                 # Prerequisites checker
-  test-telegram.ts           # Telegram connectivity test
-  test-supabase.ts           # Supabase connectivity test
-  test-voice.ts              # Voice transcription test
-  configure-launchd.ts       # macOS service setup
-  configure-services.ts      # Windows/Linux service setup
-  verify.ts                  # Full health check
+  profile.md      # User profile template
 daemon/
-  launchagent.plist          # macOS daemon template
-  claude-relay.service       # Linux systemd template
-  README-WINDOWS.md          # Windows options
+  claude-relay.service  # Systemd service
 ```
-
-## How It Works
-
-The relay does three things:
-1. **Listen** for Telegram messages (via grammY)
-2. **Spawn** Claude Code CLI with context (your profile, memory, time)
-3. **Send** the response back on Telegram
-
-Claude Code gives you full power: tools, MCP servers, web search, file access. Not just a model — an AI with hands.
-
-Your bot remembers between sessions via Supabase. Every message gets an embedding (via OpenAI, stored in Supabase) so the bot can semantically search past conversations for relevant context. It also tracks facts and goals — Claude detects when you mention something worth remembering and stores it automatically.
-
-## Environment Variables
-
-See `.env.example` for all options. The essentials:
-
-```bash
-# Required
-TELEGRAM_BOT_TOKEN=     # From @BotFather
-TELEGRAM_USER_ID=       # From @userinfobot
-SUPABASE_URL=           # From Supabase dashboard
-SUPABASE_ANON_KEY=      # From Supabase dashboard
-
-# Recommended
-USER_NAME=              # Your first name
-USER_TIMEZONE=          # e.g., America/New_York
-
-# Optional — Voice
-VOICE_PROVIDER=         # "groq" or "local"
-GROQ_API_KEY=           # For Groq (free at console.groq.com)
-
-# Note: OpenAI key for embeddings is stored in Supabase
-# (Edge Function secrets), not in this .env file.
-```
-
-## What's Next
-
-This relay is step one. It works standalone, forever. But it's also the foundation for something much bigger.
-
-200+ builders are running the full version right now — their AI calls them when something is urgent, runs board meetings with six specialized agents, sends emails with approval buttons, and never goes offline.
-
-The key: it's not just about features. It's about **mastering Claude Code** — CLAUDE.md files, MCP servers, hooks, skills. That's what turns a chatbot into real AI infrastructure. The community and course teach you that.
-
-**[Read the full story → WHATS-NEXT.md](WHATS-NEXT.md)**
-
-**Free course (6 lessons):** [autonomee.ai/telegram-bot-course](https://autonomee.ai/telegram-bot-course)
-**Subscribe on YouTube:** [youtube.com/@GodaGo](https://youtube.com/@GodaGo)
-**Join the community:** [skool.com/autonomee](https://skool.com/autonomee)
 
 ## License
 
-MIT — Take it, customize it, make it yours.
-
----
-
-Built by [Goda Go](https://youtube.com/@GodaGo)
+MIT

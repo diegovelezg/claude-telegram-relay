@@ -1,22 +1,33 @@
 /**
- * Claude Code Telegram Relay
- *
- * Minimal relay that connects Telegram to Claude Code CLI.
- * Customize this for your own needs.
- *
+ * Discord + Telegram Relay
+ * 
+ * Connects both Discord and Telegram to Claude Code CLI.
+ * Uses Diego's MCP for memory instead of Supabase.
+ * 
  * Run: bun run src/relay.ts
+ * 
+ * Environment variables required:
+ * - TELEGRAM_BOT_TOKEN (optional)
+ * - TELEGRAM_USER_ID (optional)
+ * - DISCORD_BOT_TOKEN (optional)
+ * - DISCORD_CHANNEL_IDS (comma-separated)
+ * - MCP_URL
+ * - MCP_API_KEY
+ * - CLAUDE_PATH (default: "claude")
+ * - PROJECT_DIR
  */
 
-import { Bot, Context } from "grammy";
+import { Bot as TelegramBot } from "grammy";
+import { Client as DiscordClient, GatewayIntentBits, TextChannel, ChannelType } from "discord.js";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
 import {
   processMemoryIntents,
   getMemoryContext,
   getRelevantContext,
+  testMcpConnection,
 } from "./memory.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -25,27 +36,36 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 // CONFIGURATION
 // ============================================================
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
+// Telegram (optional)
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_USER_ID = process.env.TELEGRAM_USER_ID || "";
+
+// Discord (optional)
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || "";
+const DISCORD_CHANNEL_IDS = (process.env.DISCORD_CHANNEL_IDS || "").split(",").filter(Boolean);
+
+// Claude
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
-const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 
-// Directories
+// Relay working directory
+const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".discord-telegram-relay");
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
-
-// Session tracking for conversation continuity
 const SESSION_FILE = join(RELAY_DIR, "session.json");
+
+// User config
+const USER_NAME = process.env.USER_NAME || "User";
+const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// ============================================================
+// SESSION MANAGEMENT
+// ============================================================
 
 interface SessionState {
   sessionId: string | null;
   lastActivity: string;
 }
-
-// ============================================================
-// SESSION MANAGEMENT
-// ============================================================
 
 async function loadSession(): Promise<SessionState> {
   try {
@@ -63,7 +83,7 @@ async function saveSession(state: SessionState): Promise<void> {
 let session = await loadSession();
 
 // ============================================================
-// LOCK FILE (prevent multiple instances)
+// LOCK FILE
 // ============================================================
 
 const LOCK_FILE = join(RELAY_DIR, "bot.lock");
@@ -75,7 +95,7 @@ async function acquireLock(): Promise<boolean> {
     if (existingLock) {
       const pid = parseInt(existingLock);
       try {
-        process.kill(pid, 0); // Check if process exists
+        process.kill(pid, 0);
         console.log(`Another instance running (PID: ${pid})`);
         return false;
       } catch {
@@ -95,31 +115,19 @@ async function releaseLock(): Promise<void> {
   await unlink(LOCK_FILE).catch(() => {});
 }
 
-// Cleanup on exit
 process.on("exit", () => {
-  try {
-    require("fs").unlinkSync(LOCK_FILE);
-  } catch {}
+  try { require("fs").unlinkSync(LOCK_FILE); } catch {}
 });
-process.on("SIGINT", async () => {
-  await releaseLock();
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await releaseLock();
-  process.exit(0);
-});
+process.on("SIGINT", async () => { await releaseLock(); process.exit(0); });
+process.on("SIGTERM", async () => { await releaseLock(); process.exit(0); });
 
 // ============================================================
 // SETUP
 // ============================================================
 
-if (!BOT_TOKEN) {
-  console.error("TELEGRAM_BOT_TOKEN not set!");
-  console.log("\nTo set up:");
-  console.log("1. Message @BotFather on Telegram");
-  console.log("2. Create a new bot with /newbot");
-  console.log("3. Copy the token to .env");
+// Verify at least one platform is configured
+if (!TELEGRAM_BOT_TOKEN && !DISCORD_BOT_TOKEN) {
+  console.error("No platform configured! Set TELEGRAM_BOT_TOKEN and/or DISCORD_BOT_TOKEN");
   process.exit(1);
 }
 
@@ -127,57 +135,84 @@ if (!BOT_TOKEN) {
 await mkdir(TEMP_DIR, { recursive: true });
 await mkdir(UPLOADS_DIR, { recursive: true });
 
-// ============================================================
-// SUPABASE (optional — only if configured)
-// ============================================================
-
-const supabase: SupabaseClient | null =
-  process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
-    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
-    : null;
-
-async function saveMessage(
-  role: string,
-  content: string,
-  metadata?: Record<string, unknown>
-): Promise<void> {
-  if (!supabase) return;
-  try {
-    await supabase.from("messages").insert({
-      role,
-      content,
-      channel: "telegram",
-      metadata: metadata || {},
-    });
-  } catch (error) {
-    console.error("Supabase save error:", error);
-  }
-}
-
 // Acquire lock
 if (!(await acquireLock())) {
   console.error("Could not acquire lock. Another instance may be running.");
   process.exit(1);
 }
 
-const bot = new Bot(BOT_TOKEN);
+// Test MCP connection
+console.log("[Relay] Testing MCP connection...");
+const mcpReady = await testMcpConnection();
+if (!mcpReady) {
+  console.warn("[Relay] Warning: MCP connection failed. Memory features may not work.");
+}
 
 // ============================================================
-// SECURITY: Only respond to authorized user
+// TELEGRAM BOT
 // ============================================================
 
-bot.use(async (ctx, next) => {
-  const userId = ctx.from?.id.toString();
+let telegramBot: TelegramBot | null = null;
 
-  // If ALLOWED_USER_ID is set, enforce it
-  if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
-    console.log(`Unauthorized: ${userId}`);
-    await ctx.reply("This bot is private.");
-    return;
-  }
+if (TELEGRAM_BOT_TOKEN) {
+  console.log("[Relay] Initializing Telegram bot...");
+  telegramBot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+  
+  // Security: Only respond to authorized user
+  telegramBot.use(async (ctx, next) => {
+    const userId = ctx.from?.id.toString();
+    if (TELEGRAM_USER_ID && userId !== TELEGRAM_USER_ID) {
+      console.log(`[Telegram] Unauthorized: ${userId}`);
+      await ctx.reply("This bot is private.");
+      return;
+    }
+    await next();
+  });
+}
 
-  await next();
-});
+// ============================================================
+// DISCORD BOT
+// ============================================================
+
+let discordClient: DiscordClient | null = null;
+
+if (DISCORD_BOT_TOKEN) {
+  console.log("[Relay] Initializing Discord bot...");
+  discordClient = new DiscordClient({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.DirectMessages,
+    ],
+  });
+  
+  discordClient.on("ready", () => {
+    console.log(`[Discord] Logged in as ${discordClient?.user?.tag}`);
+  });
+  
+  discordClient.on("messageCreate", async (msg) => {
+    // Ignore bot messages
+    if (msg.author.bot) return;
+    
+    // Check if in allowed channel or DM
+    const isAllowedChannel = DISCORD_CHANNEL_IDS.includes(msg.channelId);
+    const isDM = msg.channel.type === ChannelType.DM;
+    
+    if (!isAllowedChannel && !isDM) {
+      console.log(`[Discord] Message from unauthorized channel: ${msg.channelId}`);
+      return;
+    }
+    
+    console.log(`[Discord] Message: ${msg.content.substring(0, 50)}...`);
+    await msg.channel.sendTyping();
+    
+    const response = await processMessage(msg.content, msg.author.username);
+    
+    // Send response
+    await msg.reply(response);
+  });
+}
 
 // ============================================================
 // CORE: Call Claude CLI
@@ -185,41 +220,36 @@ bot.use(async (ctx, next) => {
 
 async function callClaude(
   prompt: string,
-  options?: { resume?: boolean; imagePath?: string }
+  options?: { resume?: boolean }
 ): Promise<string> {
   const args = [CLAUDE_PATH, "-p", prompt];
 
-  // Resume previous session if available and requested
   if (options?.resume && session.sessionId) {
     args.push("--resume", session.sessionId);
   }
 
   args.push("--output-format", "text");
 
-  console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`[Claude] ${prompt.substring(0, 50)}...`);
 
   try {
     const proc = spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
       cwd: PROJECT_DIR || undefined,
-      env: {
-        ...process.env,
-        // Pass through any env vars Claude might need
-      },
+      env: process.env,
     });
 
     const output = await new Response(proc.stdout).text();
     const stderr = await new Response(proc.stderr).text();
-
     const exitCode = await proc.exited;
 
     if (exitCode !== 0) {
-      console.error("Claude error:", stderr);
+      console.error("[Claude] Error:", stderr);
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
-    // Extract session ID from output if present (for --resume)
+    // Extract session ID
     const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
     if (sessionMatch) {
       session.sessionId = sessionMatch[1];
@@ -229,185 +259,47 @@ async function callClaude(
 
     return output.trim();
   } catch (error) {
-    console.error("Spawn error:", error);
-    return `Error: Could not run Claude CLI`;
+    console.error("[Claude] Spawn error:", error);
+    return "Error: Could not run Claude CLI";
   }
 }
 
 // ============================================================
-// MESSAGE HANDLERS
+// MESSAGE PROCESSING
 // ============================================================
 
-// Text messages
-bot.on("message:text", async (ctx) => {
-  const text = ctx.message.text;
-  console.log(`Message: ${text.substring(0, 50)}...`);
-
-  await ctx.replyWithChatAction("typing");
-
-  await saveMessage("user", text);
-
-  // Gather context: semantic search + facts/goals
+async function processMessage(text: string, userName?: string): Promise<string> {
+  // Gather context from MCP
   const [relevantContext, memoryContext] = await Promise.all([
-    getRelevantContext(supabase, text),
-    getMemoryContext(supabase),
+    getRelevantContext(text),
+    getMemoryContext(),
   ]);
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
+  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, userName);
   const rawResponse = await callClaude(enrichedPrompt, { resume: true });
 
-  // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, rawResponse);
+  // Process memory intents and clean response
+  const response = await processMemoryIntents(rawResponse);
 
-  await saveMessage("assistant", response);
-  await sendResponse(ctx, response);
-});
-
-// Voice messages
-bot.on("message:voice", async (ctx) => {
-  const voice = ctx.message.voice;
-  console.log(`Voice message: ${voice.duration}s`);
-  await ctx.replyWithChatAction("typing");
-
-  if (!process.env.VOICE_PROVIDER) {
-    await ctx.reply(
-      "Voice transcription is not set up yet. " +
-        "Run the setup again and choose a voice provider (Groq or local Whisper)."
-    );
-    return;
-  }
-
-  try {
-    const file = await ctx.getFile();
-    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-    const response = await fetch(url);
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    const transcription = await transcribe(buffer);
-    if (!transcription) {
-      await ctx.reply("Could not transcribe voice message.");
-      return;
-    }
-
-    await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
-
-    const [relevantContext, memoryContext] = await Promise.all([
-      getRelevantContext(supabase, transcription),
-      getMemoryContext(supabase),
-    ]);
-
-    const enrichedPrompt = buildPrompt(
-      `[Voice message transcribed]: ${transcription}`,
-      relevantContext,
-      memoryContext
-    );
-    const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = await processMemoryIntents(supabase, rawResponse);
-
-    await saveMessage("assistant", claudeResponse);
-    await sendResponse(ctx, claudeResponse);
-  } catch (error) {
-    console.error("Voice error:", error);
-    await ctx.reply("Could not process voice message. Check logs for details.");
-  }
-});
-
-// Photos/Images
-bot.on("message:photo", async (ctx) => {
-  console.log("Image received");
-  await ctx.replyWithChatAction("typing");
-
-  try {
-    // Get highest resolution photo
-    const photos = ctx.message.photo;
-    const photo = photos[photos.length - 1];
-    const file = await ctx.api.getFile(photo.file_id);
-
-    // Download the image
-    const timestamp = Date.now();
-    const filePath = join(UPLOADS_DIR, `image_${timestamp}.jpg`);
-
-    const response = await fetch(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
-    );
-    const buffer = await response.arrayBuffer();
-    await writeFile(filePath, Buffer.from(buffer));
-
-    // Claude Code can see images via file path
-    const caption = ctx.message.caption || "Analyze this image.";
-    const prompt = `[Image: ${filePath}]\n\n${caption}`;
-
-    await saveMessage("user", `[Image]: ${caption}`);
-
-    const claudeResponse = await callClaude(prompt, { resume: true });
-
-    // Cleanup after processing
-    await unlink(filePath).catch(() => {});
-
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
-    await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
-  } catch (error) {
-    console.error("Image error:", error);
-    await ctx.reply("Could not process image.");
-  }
-});
-
-// Documents
-bot.on("message:document", async (ctx) => {
-  const doc = ctx.message.document;
-  console.log(`Document: ${doc.file_name}`);
-  await ctx.replyWithChatAction("typing");
-
-  try {
-    const file = await ctx.getFile();
-    const timestamp = Date.now();
-    const fileName = doc.file_name || `file_${timestamp}`;
-    const filePath = join(UPLOADS_DIR, `${timestamp}_${fileName}`);
-
-    const response = await fetch(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
-    );
-    const buffer = await response.arrayBuffer();
-    await writeFile(filePath, Buffer.from(buffer));
-
-    const caption = ctx.message.caption || `Analyze: ${doc.file_name}`;
-    const prompt = `[File: ${filePath}]\n\n${caption}`;
-
-    await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
-
-    const claudeResponse = await callClaude(prompt, { resume: true });
-
-    await unlink(filePath).catch(() => {});
-
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
-    await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
-  } catch (error) {
-    console.error("Document error:", error);
-    await ctx.reply("Could not process document.");
-  }
-});
+  return response;
+}
 
 // ============================================================
-// HELPERS
+// PROMPT BUILDER
 // ============================================================
 
-// Load profile once at startup
 let profileContext = "";
 try {
   profileContext = await readFile(join(PROJECT_ROOT, "config", "profile.md"), "utf-8");
 } catch {
-  // No profile yet — that's fine
+  // No profile yet
 }
-
-const USER_NAME = process.env.USER_NAME || "";
-const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 function buildPrompt(
   userMessage: string,
   relevantContext?: string,
-  memoryContext?: string
+  memoryContext?: string,
+  userName?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -421,22 +313,23 @@ function buildPrompt(
   });
 
   const parts = [
-    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+    "You are a personal AI assistant responding via a messaging platform. Keep responses concise and conversational.",
   ];
 
-  if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
+  if (userName) parts.push(`You are speaking with ${userName}.`);
   parts.push(`Current time: ${timeStr}`);
+  
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
 
   parts.push(
     "\nMEMORY MANAGEMENT:" +
-      "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
-      "include these tags in your response (they are processed automatically and hidden from the user):" +
-      "\n[REMEMBER: fact to store]" +
-      "\n[GOAL: goal text | DEADLINE: optional date]" +
-      "\n[DONE: search text for completed goal]"
+    "\nWhen the user shares something worth remembering, sets goals, or completes goals," +
+    "\ninclude these tags in your response (they are processed automatically):" +
+    "\n[REMEMBER: fact to store]" +
+    "\n[GOAL: goal text | DEADLINE: optional date]" +
+    "\n[DONE: search text for completed goal]"
   );
 
   parts.push(`\nUser: ${userMessage}`);
@@ -444,50 +337,116 @@ function buildPrompt(
   return parts.join("\n");
 }
 
-async function sendResponse(ctx: Context, response: string): Promise<void> {
-  // Telegram has a 4096 character limit
-  const MAX_LENGTH = 4000;
+// ============================================================
+// TELEGRAM HANDLERS
+// ============================================================
 
-  if (response.length <= MAX_LENGTH) {
+if (telegramBot) {
+  // Text messages
+  telegramBot.on("message:text", async (ctx) => {
+    const text = ctx.message.text;
+    console.log(`[Telegram] Message: ${text.substring(0, 50)}...`);
+    await ctx.replyWithChatAction("typing");
+
+    const response = await processMessage(text, ctx.from?.first_name);
     await ctx.reply(response);
-    return;
-  }
+  });
 
-  // Split long responses
-  const chunks = [];
-  let remaining = response;
+  // Voice messages
+  telegramBot.on("message:voice", async (ctx) => {
+    const voice = ctx.message.voice;
+    console.log(`[Telegram] Voice: ${voice.duration}s`);
+    await ctx.replyWithChatAction("typing");
 
-  while (remaining.length > 0) {
-    if (remaining.length <= MAX_LENGTH) {
-      chunks.push(remaining);
-      break;
+    if (!process.env.VOICE_PROVIDER) {
+      await ctx.reply("Voice transcription not configured.");
+      return;
     }
 
-    // Try to split at a natural boundary
-    let splitIndex = remaining.lastIndexOf("\n\n", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = remaining.lastIndexOf("\n", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = remaining.lastIndexOf(" ", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = MAX_LENGTH;
+    try {
+      const file = await ctx.getFile();
+      const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      const buffer = Buffer.from(await (await fetch(url)).arrayBuffer());
+      const transcription = await transcribe(buffer);
+      
+      if (!transcription) {
+        await ctx.reply("Could not transcribe voice.");
+        return;
+      }
 
-    chunks.push(remaining.substring(0, splitIndex));
-    remaining = remaining.substring(splitIndex).trim();
-  }
+      const response = await processMessage(`[Voice]: ${transcription}`, ctx.from?.first_name);
+      await ctx.reply(response);
+    } catch (error) {
+      console.error("[Telegram] Voice error:", error);
+      await ctx.reply("Could not process voice message.");
+    }
+  });
 
-  for (const chunk of chunks) {
-    await ctx.reply(chunk);
-  }
+  // Photos
+  telegramBot.on("message:photo", async (ctx) => {
+    console.log("[Telegram] Photo received");
+    await ctx.replyWithChatAction("typing");
+
+    try {
+      const photos = ctx.message.photo;
+      const photo = photos[photos.length - 1];
+      const file = await ctx.api.getFile(photo.file_id);
+      
+      const timestamp = Date.now();
+      const filePath = join(UPLOADS_DIR, `image_${timestamp}.jpg`);
+      
+      const response = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`);
+      await writeFile(filePath, Buffer.from(await response.arrayBuffer()));
+      
+      const caption = ctx.message.caption || "Analyze this image.";
+      const prompt = `[Image: ${filePath}]\n\n${caption}`;
+      
+      const claudeResponse = await processMessage(prompt, ctx.from?.first_name);
+      
+      await unlink(filePath).catch(() => {});
+      await ctx.reply(claudeResponse);
+    } catch (error) {
+      console.error("[Telegram] Image error:", error);
+      await ctx.reply("Could not process image.");
+    }
+  });
 }
 
 // ============================================================
 // START
 // ============================================================
 
-console.log("Starting Claude Telegram Relay...");
-console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
-console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+async function start() {
+  console.log("\n" + "=".repeat(50));
+  console.log("Discord + Telegram Relay");
+  console.log("=".repeat(50));
+  
+  if (TELEGRAM_BOT_TOKEN) {
+    console.log(`[Telegram] Bot token: configured`);
+    console.log(`[Telegram] Allowed user: ${TELEGRAM_USER_ID || "ANY"}`);
+  }
+  
+  if (DISCORD_BOT_TOKEN) {
+    console.log(`[Discord] Bot token: configured`);
+    console.log(`[Discord] Allowed channels: ${DISCORD_CHANNEL_IDS.join(", ") || "ALL"}`);
+  }
+  
+  console.log(`[Claude] Path: ${CLAUDE_PATH}`);
+  console.log(`[Claude] Project: ${PROJECT_DIR || "(relay dir)"}`);
+  console.log(`[MCP] Status: ${mcpReady ? "connected" : "failed"}`);
+  console.log("=".repeat(50) + "\n");
 
-bot.start({
-  onStart: () => {
-    console.log("Bot is running!");
-  },
-});
+  // Start Telegram
+  if (telegramBot) {
+    telegramBot.start({
+      onStart: () => console.log("[Telegram] Bot is running!"),
+    });
+  }
+
+  // Start Discord
+  if (discordClient) {
+    await discordClient.login(DISCORD_BOT_TOKEN);
+  }
+}
+
+start();
