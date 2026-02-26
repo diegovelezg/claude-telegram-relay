@@ -25,16 +25,33 @@ const MCP_API_KEY = process.env.MCP_API_KEY || "";
 // ============================================================
 
 let mcpClient: Client | null = null;
+let mcpClientPromise: Promise<Client> | null = null;
 
 async function getMcpClient(): Promise<Client> {
   if (mcpClient) return mcpClient;
   
-  const transport = new SSEClientTransport(new URL(`${MCP_URL}?apiKey=${MCP_API_KEY}`));
-  mcpClient = new Client({ name: "discord-telegram-relay", version: "1.0.0" });
-  await mcpClient.connect(transport);
+  // Prevent race condition with proper mutex
+  if (mcpClientPromise) {
+    return mcpClientPromise;
+  }
   
-  console.log("[Memory] MCP connected");
-  return mcpClient;
+  mcpClientPromise = (async () => {
+    // Build headers with API key instead of query string
+    const headers: Record<string, string> = {};
+    if (MCP_API_KEY) {
+      headers["x-api-key"] = MCP_API_KEY;
+    }
+    
+    const url = new URL(MCP_URL);
+    const transport = new SSEClientTransport(url, { headers });
+    mcpClient = new Client({ name: "discord-telegram-relay", version: "1.0.0" });
+    await mcpClient.connect(transport);
+    
+    console.log("[Memory] MCP connected");
+    return mcpClient;
+  })();
+  
+  return mcpClientPromise;
 }
 
 // ============================================================
@@ -127,8 +144,27 @@ async function markGoalComplete(searchText: string): Promise<void> {
   });
   
   // Parse result and mark first matching goal as done
-  // This is simplified - in production you'd want more sophisticated matching
-  console.log(`[Memory] Would mark complete: ${searchText}`);
+  try {
+    const data = JSON.parse(result.content[0].text);
+    if (data.data?.items?.length) {
+      const firstItem = data.data.items[0];
+      if (firstItem && firstItem.id) {
+        await client.callTool({
+          name: "ledger_item_update",
+          arguments: {
+            id: firstItem.id,
+            status: "done"
+          }
+        });
+        console.log(`[Memory] Marked goal complete: ${firstItem.title}`);
+        return;
+      }
+    }
+  } catch (error) {
+    console.error("[Memory] Error parsing ledger result:", error);
+  }
+  
+  console.log(`[Memory] Could not find goal to mark complete: ${searchText}`);
 }
 
 // ============================================================

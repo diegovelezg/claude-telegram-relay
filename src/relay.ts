@@ -93,17 +93,47 @@ async function acquireLock(): Promise<boolean> {
     const existingLock = await readFile(LOCK_FILE, "utf-8").catch(() => null);
 
     if (existingLock) {
-      const pid = parseInt(existingLock);
       try {
-        process.kill(pid, 0);
-        console.log(`Another instance running (PID: ${pid})`);
-        return false;
+        const lockData = JSON.parse(existingLock);
+        const pid = lockData.pid;
+        const timestamp = lockData.timestamp;
+        
+        // Check if process is still running
+        try {
+          process.kill(pid, 0);
+          console.log(`Another instance running (PID: ${pid})`);
+          return false;
+        } catch {
+          // Stale lock - process not running
+          console.log("Stale lock found, taking over...");
+        }
+        
+        // Also check if lock is recent (within 5 minutes)
+        const lockAge = Date.now() - timestamp;
+        if (lockAge < 5 * 60 * 1000) {
+          console.log(`Recent lock still valid (${Math.round(lockAge/1000)}s ago)`);
+          return false;
+        }
       } catch {
-        console.log("Stale lock found, taking over...");
+        // Old format lock file, try to parse as PID
+        const pid = parseInt(existingLock);
+        if (!isNaN(pid)) {
+          try {
+            process.kill(pid, 0);
+            console.log(`Another instance running (PID: ${pid})`);
+            return false;
+          } catch {
+            console.log("Stale lock found, taking over...");
+          }
+        }
       }
     }
 
-    await writeFile(LOCK_FILE, process.pid.toString());
+    // Write new lock with PID and timestamp
+    await writeFile(LOCK_FILE, JSON.stringify({
+      pid: process.pid,
+      timestamp: Date.now()
+    }));
     return true;
   } catch (error) {
     console.error("Lock error:", error);
@@ -112,7 +142,9 @@ async function acquireLock(): Promise<boolean> {
 }
 
 async function releaseLock(): Promise<void> {
-  await unlink(LOCK_FILE).catch(() => {});
+  try {
+    await unlink(LOCK_FILE);
+  } catch {}
 }
 
 process.on("exit", () => {
@@ -122,8 +154,23 @@ process.on("SIGINT", async () => { await releaseLock(); process.exit(0); });
 process.on("SIGTERM", async () => { await releaseLock(); process.exit(0); });
 
 // ============================================================
-// SETUP
+// RATE LIMITING
 // ============================================================
+
+const RATE_LIMIT_WINDOW_MS = 2000; // 2 seconds
+const userLastMessage = new Map<string, number>();
+
+function checkRateLimit(userId: string): boolean {
+  const now = Date.now();
+  const last = userLastMessage.get(userId) || 0;
+  
+  if (now - last < RATE_LIMIT_WINDOW_MS) {
+    return false;
+  }
+  
+  userLastMessage.set(userId, now);
+  return true;
+}
 
 // Verify at least one platform is configured
 if (!TELEGRAM_BOT_TOKEN && !DISCORD_BOT_TOKEN) {
@@ -195,6 +242,13 @@ if (DISCORD_BOT_TOKEN) {
     // Ignore bot messages
     if (msg.author.bot) return;
     
+    // Rate limiting
+    const userId = msg.author.id;
+    if (!checkRateLimit(userId)) {
+      console.log(`[Discord] Rate limited: ${userId}`);
+      return;
+    }
+    
     // Check if in allowed channel or DM
     const isAllowedChannel = DISCORD_CHANNEL_IDS.includes(msg.channelId);
     const isDM = msg.channel.type === ChannelType.DM;
@@ -232,12 +286,26 @@ async function callClaude(
 
   console.log(`[Claude] ${prompt.substring(0, 50)}...`);
 
+  // Filter env to only pass necessary variables (avoid leaking secrets)
+  const safeEnv: Record<string, string> = {
+    HOME: process.env.HOME || "",
+    USER: process.env.USER || "",
+    PATH: process.env.PATH || "",
+    LANG: process.env.LANG || "",
+    LC_ALL: process.env.LC_ALL || "",
+    TMPDIR: process.env.TMPDIR || "",
+    CLAUDE_PATH: CLAUDE_PATH,
+    PROJECT_DIR: PROJECT_DIR,
+    USER_NAME: USER_NAME,
+    USER_TIMEZONE: USER_TIMEZONE,
+  };
+
   try {
     const proc = spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
       cwd: PROJECT_DIR || undefined,
-      env: process.env,
+      env: safeEnv,
     });
 
     const output = await new Response(proc.stdout).text();
@@ -344,6 +412,14 @@ function buildPrompt(
 if (telegramBot) {
   // Text messages
   telegramBot.on("message:text", async (ctx) => {
+    const userId = ctx.from?.id.toString() || "unknown";
+    
+    // Rate limiting
+    if (!checkRateLimit(userId)) {
+      console.log(`[Telegram] Rate limited: ${userId}`);
+      return;
+    }
+    
     const text = ctx.message.text;
     console.log(`[Telegram] Message: ${text.substring(0, 50)}...`);
     await ctx.replyWithChatAction("typing");

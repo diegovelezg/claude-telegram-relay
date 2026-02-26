@@ -13,9 +13,25 @@ let env: Record<string, string> = {};
 try {
   const content = readFileSync(envPath, "utf-8");
   for (const line of content.split("\n")) {
-    const match = line.match(/^([^=]+)=(.*)$/);
-    if (match) {
-      env[match[1].trim()] = match[2].trim();
+    // Skip empty lines and comments
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    
+    // Find first = separator
+    const eqIndex = trimmed.indexOf("=");
+    if (eqIndex === -1) continue;
+    
+    const key = trimmed.substring(0, eqIndex).trim();
+    let value = trimmed.substring(eqIndex + 1).trim();
+    
+    // Remove surrounding quotes
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    
+    if (key) {
+      env[key] = value;
     }
   }
 } catch {
